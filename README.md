@@ -1,10 +1,8 @@
 # JumpServer Interim Bastion Deployment
 
-A scripted deployment of **JumpServer Community Edition** on a Debian container host, intended as a **short-term secure bastion / PAM gateway** while an enterprise WALLIX deployment is being designed and funded.
+A scripted deployment of **JumpServer Community Edition** on a Debian container host.
 
-> **Important:** This repository is intended to accelerate a controlled interim deployment. It is **not** a substitute for the target WALLIX architecture, formal security design, hardening review, backup design, monitoring integration, or operational acceptance.
-
----
+> **Important:** This repository is intended to accelerate a controlled interim deployment.--
 
 ## Why JumpServer?
 

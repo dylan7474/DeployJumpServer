@@ -3,60 +3,30 @@ set -e
 
 INSTALL_DIR="/opt/jit-trial"
 
-echo "==> Creating deployment directory: ${INSTALL_DIR}"
-mkdir -p "${INSTALL_DIR}/bridge"
+echo "==> Cleaning up old deployment directory..."
+rm -rf "${INSTALL_DIR}"
+mkdir -p "${INSTALL_DIR}/app"
 cd "${INSTALL_DIR}"
 
 echo "==> Writing docker-compose.yml..."
 cat << 'EOF' > docker-compose.yml
-version: '3.8'
-
 services:
-  osticket-db:
-    image: mariadb:10.5
-    container_name: jit-osticket-db
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: secretpassword
-      MYSQL_DATABASE: osticket
-      MYSQL_USER: osticket
-      MYSQL_PASSWORD: osticketpassword
-    volumes:
-      - osticket_db_data:/var/lib/mysql
-
-  osticket:
-    image: elswork/osticket:latest
-    container_name: jit-osticket-web
-    restart: unless-stopped
-    ports:
-      - "8080:80"
-    environment:
-      - MYSQL_HOST=osticket-db
-      - MYSQL_USER=osticket
-      - MYSQL_PASSWORD=osticketpassword
-      - MYSQL_DATABASE=osticket
-    depends_on:
-      - osticket-db
-
-  jit-bridge:
-    build: ./bridge
-    container_name: jit-bridge-api
+  jit-portal:
+    build: ./app
+    container_name: jit-portal
     restart: unless-stopped
     ports:
       - "5000:5000"
     env_file:
       - .env
-
-volumes:
-  osticket_db_data:
 EOF
 
-echo "==> Writing Python JIT API Bridge application..."
-cat << 'EOF' > bridge/app.py
+echo "==> Writing JIT Web Portal & API application..."
+cat << 'EOF' > app/app.py
 import os
 import datetime
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, render_template_string
 
 app = Flask(__name__)
 
@@ -64,64 +34,164 @@ JUMPSERVER_URL = os.environ.get("JUMPSERVER_URL", "http://127.0.0.1")
 API_TOKEN = os.environ.get("JUMPSERVER_API_TOKEN", "")
 POLICY_ID = os.environ.get("JUMPSERVER_POLICY_ID", "")
 
-@app.route('/grant', methods=['GET', 'POST'])
-def grant_access():
-    minutes = int(request.args.get('minutes', 30))
-    now = datetime.datetime.utcnow()
-    expire_time = now + datetime.timedelta(minutes=minutes)
-    expire_str = expire_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+tickets = []
 
-    url = f"{JUMPSERVER_URL.rstrip('/')}/api/v1/policies/authorizations/{POLICY_ID}/"
-    headers = {
-        "Authorization": f"Bearer {API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "is_active": True,
-        "date_expired": expire_str
-    }
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>JumpServer JIT Ticket Portal</title>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; background: #f4f6f9; margin: 0; padding: 20px; color: #333; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1, h2 { margin-top: 0; color: #1a202c; }
+        .btn { background: #00a676; color: white; border: none; padding: 10px 18px; border-radius: 6px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; }
+        .btn-danger { background: #e53e3e; }
+        .btn:hover { opacity: 0.9; }
+        input, select { padding: 8px; border: 1px solid #cbd5e0; border-radius: 4px; width: 100%; box-sizing: border-box; margin-bottom: 12px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { text-align: left; padding: 10px; border-bottom: 1px solid #e2e8f0; }
+        .badge { padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
+        .badge-pending { background: #feebc8; color: #744210; }
+        .badge-approved { background: #c6f6d5; color: #22543d; }
+        .badge-revoked { background: #fed7d7; color: #742a2a; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>JumpServer JIT Access Portal</h1>
+    
+    <div class="card">
+        <h2>1. Submit Access Request (Vendor)</h2>
+        <form action="/submit" method="POST">
+            <label>Vendor User</label>
+            <input type="text" name="user" value="Dylan Jones" required>
+            <label>Target Asset</label>
+            <input type="text" name="asset" value="WinServer-01" readonly>
+            <label>Requested Duration (Minutes)</label>
+            <select name="minutes">
+                <option value="15">15 Minutes</option>
+                <option value="30">30 Minutes</option>
+                <option value="60">1 Hour</option>
+            </select>
+            <label>Business Reason</label>
+            <input type="text" name="reason" value="Emergency Server Maintenance" required>
+            <button type="submit" class="btn">Submit Ticket</button>
+        </form>
+    </div>
 
-    try:
-        resp = requests.patch(url, json=payload, headers=headers, verify=False)
-        return jsonify({
-            "status": "granted" if resp.status_code == 200 else "error",
-            "jumpserver_status": resp.status_code,
-            "expires_at": expire_str,
-            "details": resp.json() if resp.status_code == 200 else resp.text
-        }), resp.status_code
-    except Exception as e:
-        return jsonify({"status": "failed", "error": str(e)}), 500
+    <div class="card">
+        <h2>2. Approval Queue (Admin)</h2>
+        {% if not tickets %}
+            <p>No tickets submitted yet.</p>
+        {% else %}
+            <table>
+                <tr>
+                    <th>User</th>
+                    <th>Duration</th>
+                    <th>Reason</th>
+                    <th>Status</th>
+                    <th>Action</th>
+                </tr>
+                {% for t in tickets %}
+                <tr>
+                    <td>{{ t.user }}</td>
+                    <td>{{ t.minutes }}m</td>
+                    <td>{{ t.reason }}</td>
+                    <td><span class="badge badge-{{ t.status }}">{{ t.status.upper() }}</span></td>
+                    <td>
+                        {% if t.status == 'pending' %}
+                            <a href="/approve/{{ loop.index0 }}" class="btn">Approve Access</a>
+                        {% elif t.status == 'approved' %}
+                            <a href="/revoke/{{ loop.index0 }}" class="btn btn-danger">Revoke Now</a>
+                        {% else %}
+                            -
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </table>
+        {% endif %}
+    </div>
+</div>
+</body>
+</html>
+"""
 
-@app.route('/revoke', methods=['GET', 'POST'])
-def revoke_access():
-    url = f"{JUMPSERVER_URL.rstrip('/')}/api/v1/policies/authorizations/{POLICY_ID}/"
-    headers = {
-        "Authorization": f"Bearer {API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {"is_active": False}
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE, tickets=tickets)
 
-    try:
-        resp = requests.patch(url, json=payload, headers=headers, verify=False)
-        return jsonify({
-            "status": "revoked" if resp.status_code == 200 else "error",
-            "jumpserver_status": resp.status_code
-        }), resp.status_code
-    except Exception as e:
-        return jsonify({"status": "failed", "error": str(e)}), 500
+@app.route('/submit', methods=['POST'])
+def submit():
+    tickets.append({
+        'user': request.form.get('user'),
+        'minutes': int(request.form.get('minutes', 15)),
+        'reason': request.form.get('reason'),
+        'status': 'pending',
+        'expires_at': None
+    })
+    return render_template_string("<script>window.location='/';</script>")
+
+@app.route('/approve/<int:ticket_id>')
+def approve(ticket_id):
+    if ticket_id < len(tickets):
+        t = tickets[ticket_id]
+        now = datetime.datetime.utcnow()
+        expire_time = now + datetime.timedelta(minutes=t['minutes'])
+        expire_str = expire_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        url = f"{JUMPSERVER_URL.rstrip('/')}/api/v1/policies/authorizations/{POLICY_ID}/"
+        headers = {
+            "Authorization": f"Bearer {API_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {"is_active": True, "date_expired": expire_str}
+
+        try:
+            resp = requests.patch(url, json=payload, headers=headers, verify=False)
+            if resp.status_code == 200:
+                t['status'] = 'approved'
+                t['expires_at'] = expire_str
+        except Exception as e:
+            print("API Error:", e)
+
+    return render_template_string("<script>window.location='/';</script>")
+
+@app.route('/revoke/<int:ticket_id>')
+def revoke(ticket_id):
+    if ticket_id < len(tickets):
+        t = tickets[ticket_id]
+        url = f"{JUMPSERVER_URL.rstrip('/')}/api/v1/policies/authorizations/{POLICY_ID}/"
+        headers = {
+            "Authorization": f"Bearer {API_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {"is_active": False}
+
+        try:
+            resp = requests.patch(url, json=payload, headers=headers, verify=False)
+            if resp.status_code == 200:
+                t['status'] = 'revoked'
+        except Exception as e:
+            print("API Error:", e)
+
+    return render_template_string("<script>window.location='/';</script>")
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
 EOF
 
-echo "==> Writing bridge Dockerfile & dependencies..."
-cat << 'EOF' > bridge/requirements.txt
+echo "==> Writing app dependencies..."
+cat << 'EOF' > app/requirements.txt
 flask==3.0.2
 requests==2.31.0
 urllib3==2.2.1
 EOF
 
-cat << 'EOF' > bridge/Dockerfile
+cat << 'EOF' > app/Dockerfile
 FROM python:3.11-slim
 WORKDIR /app
 COPY requirements.txt .
@@ -140,13 +210,12 @@ JUMPSERVER_POLICY_ID=YOUR_AUTHORIZATION_POLICY_ID_HERE
 EOF
 fi
 
-echo "==> Building and launching Docker stack..."
+echo "==> Building and launching JIT Portal container..."
 docker compose up -d --build
 
 echo ""
 echo "=================================================================="
 echo " Deployment Complete!"
 echo "=================================================================="
-echo " - osTicket Web Interface: http://<DEBIAN_IP>:8080"
-echo " - JIT Bridge API:         http://<DEBIAN_IP>:5000"
+echo " - JIT Interactive Ticket Portal: http://<DEBIAN_IP>:5000"
 echo "=================================================================="

@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -e
+
+INSTALL_DIR="/opt/jit-trial"
+
+echo "==> Creating deployment directory: ${INSTALL_DIR}"
+mkdir -p "${INSTALL_DIR}/bridge"
+cd "${INSTALL_DIR}"
+
+echo "==> Writing docker-compose.yml..."
+cat << 'EOF' > docker-compose.yml
+version: '3.8'
+
+services:
+  osticket-db:
+    image: mariadb:10.5
+    container_name: jit-osticket-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: secretpassword
+      MYSQL_DATABASE: osticket
+      MYSQL_USER: osticket
+      MYSQL_PASSWORD: osticketpassword
+    volumes:
+      - osticket_db_data:/var/lib/mysql
+
+  osticket:
+    image: elswork/osticket:latest
+    container_name: jit-osticket-web
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    environment:
+      - MYSQL_HOST=osticket-db
+      - MYSQL_USER=osticket
+      - MYSQL_PASSWORD=osticketpassword
+      - MYSQL_DATABASE=osticket
+    depends_on:
+      - osticket-db
+
+  jit-bridge:
+    build: ./bridge
+    container_name: jit-bridge-api
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+
+volumes:
+  osticket_db_data:
+EOF
+
+echo "==> Writing Python JIT API Bridge application..."
+cat << 'EOF' > bridge/app.py
+import os
+import datetime
+import requests
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+JUMPSERVER_URL = os.environ.get("JUMPSERVER_URL", "http://127.0.0.1")
+API_TOKEN = os.environ.get("JUMPSERVER_API_TOKEN", "")
+POLICY_ID = os.environ.get("JUMPSERVER_POLICY_ID", "")
+
+@app.route('/grant', methods=['GET', 'POST'])
+def grant_access():
+    minutes = int(request.args.get('minutes', 30))
+    now = datetime.datetime.utcnow()
+    expire_time = now + datetime.timedelta(minutes=minutes)
+    expire_str = expire_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    url = f"{JUMPSERVER_URL.rstrip('/')}/api/v1/policies/authorizations/{POLICY_ID}/"
+    headers = {
+        "Authorization": f"Bearer {API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "is_active": True,
+        "date_expired": expire_str
+    }
+
+    try:
+        resp = requests.patch(url, json=payload, headers=headers, verify=False)
+        return jsonify({
+            "status": "granted" if resp.status_code == 200 else "error",
+            "jumpserver_status": resp.status_code,
+            "expires_at": expire_str,
+            "details": resp.json() if resp.status_code == 200 else resp.text
+        }), resp.status_code
+    except Exception as e:
+        return jsonify({"status": "failed", "error": str(e)}), 500
+
+@app.route('/revoke', methods=['GET', 'POST'])
+def revoke_access():
+    url = f"{JUMPSERVER_URL.rstrip('/')}/api/v1/policies/authorizations/{POLICY_ID}/"
+    headers = {
+        "Authorization": f"Bearer {API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {"is_active": False}
+
+    try:
+        resp = requests.patch(url, json=payload, headers=headers, verify=False)
+        return jsonify({
+            "status": "revoked" if resp.status_code == 200 else "error",
+            "jumpserver_status": resp.status_code
+        }), resp.status_code
+    except Exception as e:
+        return jsonify({"status": "failed", "error": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+EOF
+
+echo "==> Writing bridge Dockerfile & dependencies..."
+cat << 'EOF' > bridge/requirements.txt
+flask==3.0.2
+requests==2.31.0
+urllib3==2.2.1
+EOF
+
+cat << 'EOF' > bridge/Dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+EXPOSE 5000
+CMD ["python", "app.py"]
+EOF
+
+echo "==> Creating environment configuration template (.env)..."
+if [ ! -f .env ]; then
+cat << 'EOF' > .env
+JUMPSERVER_URL=http://jumpserver.dylanjones.org
+JUMPSERVER_API_TOKEN=YOUR_JUMPSERVER_API_TOKEN_HERE
+JUMPSERVER_POLICY_ID=YOUR_AUTHORIZATION_POLICY_ID_HERE
+EOF
+fi
+
+echo "==> Building and launching Docker stack..."
+docker compose up -d --build
+
+echo ""
+echo "=================================================================="
+echo " Deployment Complete!"
+echo "=================================================================="
+echo " - osTicket Web Interface: http://<DEBIAN_IP>:8080"
+echo " - JIT Bridge API:         http://<DEBIAN_IP>:5000"
+echo "=================================================================="

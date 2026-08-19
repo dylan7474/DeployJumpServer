@@ -2,7 +2,7 @@
 
 A scripted deployment of **JumpServer Community Edition** on a Debian container host.
 
-> **Important:** This repository is intended to accelerate a controlled interim deployment.--
+> **Important:** This repository is intended to accelerate a controlled interim deployment.
 
 ## Why JumpServer?
 
